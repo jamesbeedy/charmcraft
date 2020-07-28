@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 CHARM_METADATA = 'metadata.yaml'
 BUILD_DIRNAME = 'build'
 VENV_DIRNAME = 'venv'
+SITE_PACKAGES = 'lib/python3.8/site-packages'
 
 # copy these if they exist
 CHARM_OPTIONAL = [
@@ -51,7 +52,8 @@ DISPATCH_FILENAME = 'dispatch'
 # to be the value it would've otherwise been.
 DISPATCH_CONTENT = """#!/bin/sh
 
-JUJU_DISPATCH_PATH="${{JUJU_DISPATCH_PATH:-$0}}" PYTHONPATH=lib:venv ./{entrypoint_relative_path}
+JUJU_DISPATCH_PATH="${{JUJU_DISPATCH_PATH:-$0}}" PYTHONPATH=lib:venv/{site_packages} \
+./venv/bin/python3 ./{entrypoint_relative_path}
 """
 
 # The minimum set of hooks to be provided for compatibility with old Juju
@@ -86,6 +88,8 @@ class Builder:
         self.requirement_paths = args['requirement']
 
         self.buildpath = self.charmdir / BUILD_DIRNAME
+        self.venvpath = self.buildpath / VENV_DIRNAME
+        self.build_site_packages = self.venvpath / SITE_PACKAGES
 
     def run(self):
         """Main building process."""
@@ -140,7 +144,9 @@ class Builder:
         else:
             logger.debug("Creating the dispatch mechanism")
             dispatch_content = DISPATCH_CONTENT.format(
-                entrypoint_relative_path=linked_entrypoint.relative_to(self.buildpath))
+                entrypoint_relative_path=linked_entrypoint.relative_to(self.buildpath),
+                site_packages=SITE_PACKAGES
+            )
             dispatch_path = self.buildpath / DISPATCH_FILENAME
             with dispatch_path.open("wt", encoding="utf8") as fh:
                 fh.write(dispatch_content)
@@ -191,20 +197,45 @@ class Builder:
             if from_dir.exists():
                 self._link_to_buildpath(from_dir)
 
-        # virtualenv with other dependencies (if any)
-        if self.requirement_paths:
-            retcode = polite_exec(['pip3', 'list'])
-            if retcode:
-                raise CommandError("problems using pip")
+        # Create the venv inside of the builddir at venvpath location.
+        #
+        # Argument explanation:
+        #
+        # * --clear
+        # There shouln't be any existing venv when we create the venv here,
+        # but in the case there is and existing venv, we pass --clear to
+        # remove it before creating the new one.
+        #
+        # * --copies
+        # We pass --copies to ensure we get the actual pyhton3 binary in the venv
+        # and not a symlink.
+        #
+        # # --without-pip
+        # The pip3 used to install charm requirements.txt is provided by the snap
+        # or from the host system.
+        create_venv_cmd = [
+            'python3', '-m', 'venv', '--copies',
+            '--clear', '--without-pip', str(self.venvpath)
+        ]
+        retcode = polite_exec(create_venv_cmd)
+        if retcode:
+            raise CommandError("problem creating venv")
 
-            venvpath = self.buildpath / VENV_DIRNAME
-            cmd = [
-                'pip3', 'install',  # base command
-                '--target={}'.format(venvpath),  # put all the resulting files in that specific dir
+        # Remove the unusable/unneeded activate files created with the venv.
+        for activate_file in os.listdir(f"{self.venvpath}/bin"):
+            if 'activate' in activate_file or 'Activate' in activate_file:
+                os.remove(f"{self.venvpath}/bin/{activate_file}")
+
+        # install requirements into virtualenv with other dependencies (if any)
+        if self.requirement_paths:
+            # Use system pip3 to install dependencies into the venv.
+            install_pip_deps_cmd = [
+                'pip3', 'install',
+                '--target={}'.format(self.build_site_packages)
             ]
             for reqspath in self.requirement_paths:
-                cmd.append('--requirement={}'.format(reqspath))  # the dependencies file(s)
-            retcode = polite_exec(cmd)
+                install_pip_deps_cmd.append('--requirement={}'.format(reqspath))  # the dependencies file(s)
+            retcode = polite_exec(install_pip_deps_cmd)
             if retcode:
                 raise CommandError("problems installing dependencies")
 
